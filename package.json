@@ -1,0 +1,38 @@
+{
+  "name": "@dsh-external/dsh-subagent-antigravity",
+  "version": "0.1.0",
+  "description": "Delegate tasks to Google Antigravity CLI (agy) as a DSH subagent — no Gemini API key needed, uses your Antigravity login",
+  "type": "module",
+  "main": "./lib/index.js",
+  "types": "./lib/types/index.d.ts",
+  "files": [
+    "lib"
+  ],
+  "license": "MIT",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "antigravity",
+    "agy",
+    "gemini",
+    "subagent"
+  ],
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/dsh-subagent": ">=0.1.0-rc.6 <0.3.0",
+    "@deepseek-ai/dsh-subprocess": ">=0.1.0-rc.6 <0.3.0",
+    "@deepseek-ai/dsh-jobs": ">=0.1.0-rc.6 <0.3.0",
+    "@deepseek-ai/dsh-tools": ">=0.1.0-rc.6 <0.3.0",
+    "@deepseek-ai/schemastery": "^3.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.13.3",
+    "typescript": "^5.9.0"
+  },
+  "scripts": {
+    "build": "bash scripts/build.sh",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "selftest": "node scripts/selftest.mjs",
+    "selftest:e2e": "node scripts/selftest.mjs --e2e"
+  }
+}
