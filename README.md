@@ -31,7 +31,7 @@ dsh plugin --profile web add github:ZEM17/dsh-subagent-agy
 ```
 
 **From a tarball**: download
-`dsh-external-dsh-subagent-antigravity-0.1.0.tgz` from the
+`dsh-external-dsh-subagent-antigravity-0.2.0.tgz` from the
 [releases page](https://github.com/ZEM17/dsh-subagent-agy/releases), then:
 
 ```bash
@@ -52,6 +52,8 @@ prompt it explicitly:
 |---|---|---|
 | new task | `antigravity` | delegate a self-contained task to agy (fresh conversation); returns a `task` key |
 | follow-up | `antigravity_followup` | continue a previous agy conversation via its `task` key — full context carries over |
+| list | `antigravity_tasks` | list running tasks + recent finished tasks; `task` keys survive DSH restarts |
+| cancel | `antigravity_cancel` | stop a running task by its `task` key (agy process tree terminated) |
 | login | `antigravity_login` | pop the interactive agy login window (also opens automatically on auth failures) |
 
 Example prompts:
@@ -79,6 +81,12 @@ directory in the tool's `dirs` parameter (or the `addDirs` config).
   you posted on live progress and reports the final result when done.
 - **Continue a task**: tell the model to continue using the `task` key from a
   previous call.
+- **Find a task again**: `antigravity_tasks` lists running and recent
+  finished tasks — task keys are recorded in
+  `~/.dsh/agy-conversations.json` and survive DSH restarts, so a key can
+  always be recovered for follow-up.
+- **Stop a task**: `antigravity_cancel` with the running task's key stops it
+  (also possible via `job_kill` for background jobs).
 
 ---
 
@@ -104,6 +112,8 @@ dsh-subagent-antigravity:
 | `toolName` | `antigravity` | new-task tool name |
 | `followupToolName` | `antigravity_followup` | follow-up tool name |
 | `loginToolName` | `antigravity_login` | login-window tool name |
+| `tasksToolName` | `antigravity_tasks` | tasks-listing tool name |
+| `cancelToolName` | `antigravity_cancel` | cancel-running-task tool name |
 | `command` | `agy` | executable (PATH name or absolute path) |
 | `model` | `''` | `--model <slug>` (see `agy models`); empty = agy default |
 | `effort` | `''` | `--effort low\|medium\|high`; empty = omit |
@@ -139,6 +149,12 @@ same conversation via `--conversation <id>`. Background runs use
 (`job_output` / `job_kill`). A local watchdog terminates hung runs, and all
 timeouts interrupt: nothing ever waits forever.
 
+`antigravity_tasks` surfaces the durable registry (restart-safe) plus live
+in-flight runs, and `antigravity_cancel` stops a running one. The registry
+self-heals: a corrupted file is backed up once (`*.corrupt`) and reset
+instead of being silently overwritten, and all registry writes are
+serialized, so concurrent runs never lose each other's records.
+
 ---
 
 ## Troubleshooting
@@ -152,6 +168,7 @@ timeouts interrupt: nothing ever waits forever.
 | `cannot resolve "agy"` | set `AGY_BIN` to the agy executable |
 | task hangs on a browser tool | `avoidBrowser` (default on) prevents it; set `false` only when a browser preview is genuinely needed |
 | `file size (…) exceeds limit` | agy's read tool caps at 4 MB; `avoidLargeReads` (default on) tells agy to use grep/sed instead — or slim the file |
+| registry corrupted | the plugin backs the damaged file up once to `*.corrupt` and restarts the registry fresh — history is never silently overwritten |
 
 ---
 

@@ -37,6 +37,14 @@
  * - The follow-up registry is written atomically (tmp + rename) and all
  *   writes are serialized through a module-level queue, so concurrent tool
  *   calls cannot clobber each other.
+ * - The registry self-heals: a corrupt or wrongly-shaped file is backed up
+ *   once (`*.corrupt`, mtime-guarded) and reset instead of being silently
+ *   overwritten by the next save; malformed entries are dropped with a
+ *   warning; and the read-modify-write cycles themselves are serialized, so
+ *   concurrent runs cannot lose each other's records.
+ * - A tasks/cancel layer (`antigravity_tasks` / `antigravity_cancel`) lists
+ *   in-flight runs plus durable history (restart-safe) and can stop a
+ *   running agy; all in-flight runs are terminated on plugin stop/update.
  * - Follow-ups to the SAME conversation are serialized per conversation id,
  *   so two concurrent prompts cannot corrupt one agy conversation file.
  * - Prompts are capped at MAX_ARGV_PROMPT_CHARS for argv safety.
@@ -86,6 +94,8 @@ const MAX_STDOUT_BYTES = 1 << 20
 const MAX_STDOUT_SPILL_BYTES = 64 << 20
 /** stderr stays a bounded diagnostic tail. */
 const MAX_STDERR_BYTES = 64 << 10
+/** Background live-output window cap (8 MiB): old deltas drop so a long run cannot grow memory unboundedly. */
+const MAX_VISIBLE_BYTES = 8 << 20
 /** Durable follow-up registry cap. */
 const MAX_TASK_RECORDS = 50
 /** In-memory run bridge cap. */
@@ -189,6 +199,10 @@ export const Config = z.object({
    * click the taskbar icon to open it when the browser flow needs input.
    */
   loginWindowMinimized: z.boolean().default(true),
+  /** Model-facing tool name for listing tasks (running + recent registry history). */
+  tasksToolName: z.string().default('antigravity_tasks'),
+  /** Model-facing tool name for stopping a running task by its task key. */
+  cancelToolName: z.string().default('antigravity_cancel'),
   /**
    * Wire output format for foreground runs. `json` is preferred: it returns
    * the agy `conversation_id` (required for follow-ups) plus a
@@ -247,6 +261,8 @@ export interface Config {
   autoLoginWindow: boolean
   loginToolName: string
   loginWindowMinimized: boolean
+  tasksToolName: string
+  cancelToolName: string
   outputFormat: 'json' | 'text'
   extraArgs: string[]
   cwd: string
@@ -317,14 +333,82 @@ function registryDir(base: string): string {
   return dir.length === 0 ? '.' : dir
 }
 
-export function loadTaskRegistry(config: Config): Record<string, TaskRecord> {
+/** Back up a corrupt registry file once per corruption event (mtime guard), then reset. */
+function backupCorruptRegistry(file: string, rawText: string, warn: (message: string) => void): void {
+  if (rawText.trim().length === 0) return
+  const backup = `${file}.corrupt`
   try {
-    const raw = JSON.parse(readFileSync(registryFilePath(config), 'utf8')) as unknown
-    if (raw !== null && typeof raw === 'object' && !Array.isArray(raw)) return raw as Record<string, TaskRecord>
-    return {}
+    const backupStat = statSync(backup)
+    const fileStat = statSync(file)
+    if (backupStat.mtimeMs >= fileStat.mtimeMs) {
+      warn(
+        `${PREFIX}: task registry ${file} is corrupt (${rawText.length} bytes) — the previous content is preserved at ${backup}; the registry restarts fresh`,
+      )
+      return
+    }
+  } catch {
+    // no backup yet — write one below
+  }
+  try {
+    writeFileSync(backup, rawText, 'utf8')
+    warn(`${PREFIX}: task registry ${file} is corrupt (${rawText.length} bytes) — original backed up to ${backup}; the registry restarts fresh`)
+  } catch (error) {
+    warn(`${PREFIX}: task registry ${file} is corrupt (${rawText.length} bytes) and could not be backed up: ${String(error)}`)
+  }
+}
+
+/**
+ * Load the durable follow-up registry, self-healing on damage: a missing
+ * file is a normal fresh state; a corrupt or wrongly-shaped file is backed
+ * up once (`.corrupt`, guarded by mtime) instead of being silently
+ * overwritten by the next save; malformed entries are dropped with a
+ * warning. A crash or hand-edit can never silently wipe the history.
+ */
+export function loadTaskRegistry(config: Config, logger?: RegistryLogger): Record<string, TaskRecord> {
+  const file = registryFilePath(config)
+  const warn = logger?.warn ?? ((message: string) => console.warn(message))
+  let rawText: string
+  try {
+    rawText = readFileSync(file, 'utf8')
   } catch {
     return {}
   }
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(rawText)
+  } catch {
+    backupCorruptRegistry(file, rawText, warn)
+    return {}
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    backupCorruptRegistry(file, rawText, warn)
+    return {}
+  }
+  const records: Record<string, TaskRecord> = {}
+  let dropped = 0
+  for (const [key, value] of Object.entries(parsed)) {
+    const entry = value as Partial<TaskRecord> | null | undefined
+    if (
+      entry !== null &&
+      typeof entry === 'object' &&
+      typeof entry.conversationId === 'string' &&
+      entry.conversationId.length > 0 &&
+      typeof entry.cwd === 'string' &&
+      typeof entry.createdAt === 'number' &&
+      Number.isFinite(entry.createdAt)
+    ) {
+      records[key] = {
+        conversationId: entry.conversationId,
+        cwd: entry.cwd,
+        label: typeof entry.label === 'string' ? entry.label : '',
+        createdAt: entry.createdAt,
+      }
+    } else {
+      dropped += 1
+    }
+  }
+  if (dropped > 0) warn(`${PREFIX}: dropped ${dropped} malformed entry(ies) from task registry ${file}`)
+  return records
 }
 
 /** Trim to the newest MAX_TASK_RECORDS entries and write atomically (tmp + rename). */
@@ -361,6 +445,33 @@ let registryTail: Promise<void> = Promise.resolve()
 export function saveTaskRegistry(config: Config, records: Record<string, TaskRecord>, logger?: RegistryLogger): Promise<void> {
   const run = registryTail.then(() => {
     try {
+      doSaveRegistry(config, records)
+    } catch (error) {
+      const warn = logger?.warn ?? ((message: string) => console.warn(message))
+      warn(`${PREFIX}: failed to persist task registry: ${String(error)}`)
+    }
+  })
+  registryTail = run
+  return run
+}
+
+/**
+ * Atomically read-modify-write the durable registry through the same
+ * serialization queue as {@link saveTaskRegistry}: concurrent tool calls
+ * (e.g. a foreground and a background run finishing at the same time) can
+ * no longer lose each other's records to a stale read-modify-write race.
+ * The write itself is atomic (tmp + rename) and failures are contained
+ * (best-effort persistence, like saveTaskRegistry).
+ */
+export function updateTaskRegistry(
+  config: Config,
+  mutate: (records: Record<string, TaskRecord>) => void,
+  logger?: RegistryLogger,
+): Promise<void> {
+  const run = registryTail.then(() => {
+    try {
+      const records = loadTaskRegistry(config, logger)
+      mutate(records)
       doSaveRegistry(config, records)
     } catch (error) {
       const warn = logger?.warn ?? ((message: string) => console.warn(message))
@@ -532,6 +643,15 @@ export interface AntigravityBackgroundHandle {
   readOutput: () => string
 }
 
+/** One in-flight run tracked for the tasks/cancel tool layer (foreground or background). */
+export interface ActiveRunInfo {
+  label: string
+  cwd: string
+  startedAt: number
+  background: boolean
+  cancel: () => void
+}
+
 /** Everything both the foreground and the background path need before spawning. */
 interface SpawnPlan {
   childCwd: string
@@ -562,6 +682,8 @@ class AntigravitySubagentProvider implements SubagentProvider {
   private flagSupport: AgyFlagSupport | undefined
   /** Per-provider run id sequence (module-level state would reset on HMR reloads). */
   private runSeq = 0
+  /** Live in-flight runs (foreground + background), for the tasks/cancel tools. */
+  private readonly activeRuns = new Map<string, ActiveRunInfo>()
 
   constructor(
     private readonly ctx: Context,
@@ -574,6 +696,46 @@ class AntigravitySubagentProvider implements SubagentProvider {
   /** The bridge record for one finished run (for persistence), if captured. */
   recordOf(runId: string): TaskRecord | undefined {
     return this.runRecords.get(runId)
+  }
+
+  /** Register one in-flight run; released automatically when `settled` resolves or rejects. */
+  private trackActive(task: string, info: ActiveRunInfo, settled: Promise<unknown>): void {
+    this.activeRuns.set(task, info)
+    const release = (): void => {
+      if (this.activeRuns.get(task) === info) this.activeRuns.delete(task)
+    }
+    void settled.then(release, release)
+  }
+
+  /** Snapshot of every in-flight run (foreground + background), newest first. */
+  listActive(): { task: string; label: string; cwd: string; background: boolean; startedAt: number }[] {
+    return [...this.activeRuns.entries()]
+      .sort((a, b) => b[1].startedAt - a[1].startedAt)
+      .map(([task, info]) => ({
+        task,
+        label: info.label,
+        cwd: info.cwd,
+        background: info.background,
+        startedAt: info.startedAt,
+      }))
+  }
+
+  /** Request cancellation of one in-flight run by its task key; false when it is not tracked. */
+  cancelActive(task: string): boolean {
+    const info = this.activeRuns.get(task)
+    if (info === undefined) return false
+    info.cancel()
+    return true
+  }
+
+  /** Terminate every in-flight run (plugin stop/update): returns how many were cancelled. */
+  terminateAllActive(): number {
+    let count = 0
+    for (const info of this.activeRuns.values()) {
+      info.cancel()
+      count += 1
+    }
+    return count
   }
 
   private nextRunId(): string {
@@ -916,10 +1078,10 @@ class AntigravitySubagentProvider implements SubagentProvider {
       watchdog = setTimeout(() => {
         timedOut = true
         ctx.logger.warn(
-          `${PREFIX}: agy run exceeded ${config.printTimeoutMs + config.watchdogMarginMs}ms watchdog (print-timeout ${config.printTimeoutMs}ms + margin ${config.watchdogMarginMs}ms), terminating the process tree`,
+          `${PREFIX}: agy run exceeded ${timeoutMs + config.watchdogMarginMs}ms watchdog (ceiling ${timeoutMs}ms + margin ${config.watchdogMarginMs}ms), terminating the process tree`,
         )
         ensureTerminated()
-      }, config.printTimeoutMs + config.watchdogMarginMs)
+      }, timeoutMs + config.watchdogMarginMs)
     }
     const disarmWatchdog = (): void => {
       clearTimeout(watchdog)
@@ -960,6 +1122,8 @@ class AntigravitySubagentProvider implements SubagentProvider {
 
     const attempt = async (): Promise<SubagentResult> => {
       try {
+        // A cancellation that arrived before the spawn must not spawn at all.
+        if (cancelled || request.signal.aborted) return { output: [], stopReason: 'aborted' }
         let handle = spawnOnce(plan.jsonMode)
         armWatchdog()
         let outcome = await handle.done
@@ -987,7 +1151,7 @@ class AntigravitySubagentProvider implements SubagentProvider {
           return {
             output: textBlocks(
               authHintFor(
-                `agy did not finish within ${config.printTimeoutMs + config.watchdogMarginMs}ms (print-timeout ${config.printTimeoutMs}ms + watchdog margin); the process tree was terminated.${
+                `agy did not finish within ${timeoutMs + config.watchdogMarginMs}ms (ceiling ${timeoutMs}ms + watchdog margin); the process tree was terminated.${
                   stderr.trim().length > 0 ? `\n${stderr.trim()}` : ''
                 }`,
               ),
@@ -1040,6 +1204,21 @@ class AntigravitySubagentProvider implements SubagentProvider {
       onAbort,
       onError: (error, stopReason) => ctx.logger.warn(`${PREFIX}: agy run failed (${stopReason}): ${error.message}`),
     })
+    // Track for the tasks/cancel tools; released when the result settles.
+    this.trackActive(
+      plan.id,
+      {
+        label: plan.label,
+        cwd: plan.childCwd,
+        startedAt: Date.now(),
+        background: false,
+        cancel: () => {
+          cancelled = true
+          ensureTerminated()
+        },
+      },
+      result,
+    )
     return subprocessRunHandle({
       id: plan.id,
       result,
@@ -1091,7 +1270,19 @@ class AntigravitySubagentProvider implements SubagentProvider {
     let taskLineEmitted = false
     let handle: SubprocessHandle | undefined
     let watchdog: NodeJS.Timeout | undefined
+    let cancelledByRequest = false
     const controller = new AbortController()
+
+    /** Append to the live-output window, dropping the oldest bytes past MAX_VISIBLE_BYTES. */
+    const appendVisible = (chunk: string): void => {
+      if (chunk.length === 0) return
+      visible += chunk
+      if (visible.length > MAX_VISIBLE_BYTES) {
+        const drop = visible.length - MAX_VISIBLE_BYTES
+        visible = visible.slice(drop)
+        readOffset = Math.max(0, readOffset - drop)
+      }
+    }
 
     const terminate = (): void => {
       handle?.terminate()
@@ -1132,13 +1323,13 @@ class AntigravitySubagentProvider implements SubagentProvider {
           const delta = p.text_delta
           if (typeof delta === 'string' && delta.length > 0) {
             sawDelta = true
-            visible += delta
+            appendVisible(delta)
           }
           // Compact progress marker for every non-text step (tool calls,
           // checkpoints...), so a job_output poll shows what agy is doing.
           const stepType = typeof p.step_type === 'string' ? p.step_type : ''
           if (p.state === 'DONE' && stepType.length > 0 && stepType !== 'agent_response' && stepType !== 'user_input' && stepType !== 'unknown') {
-            visible += `\n[agy: ${stepType} step done]\n`
+            appendVisible(`\n[agy: ${stepType} step done]\n`)
           }
         }
         return
@@ -1196,18 +1387,20 @@ class AntigravitySubagentProvider implements SubagentProvider {
     }
 
     const done = (async (): Promise<{ status: 'killed' | 'completed' | 'failed'; detail: string }> => {
+      let status: 'killed' | 'completed' | 'failed'
+      let detail: string
       try {
         spawnOnce()
         const outcome = await handle!.done
         const stderr = handle!.collected?.stderr?.readFrom(0).text ?? ''
-        let status: 'killed' | 'completed' | 'failed'
-        let detail: string
         if (timedOut) {
           status = 'killed'
           detail = `agy did not finish within ${ceiling + config.watchdogMarginMs}ms (ceiling ${ceiling}ms + watchdog margin); the process tree was terminated`
-        } else if (outcome.signal !== null) {
+        } else if (outcome.signal !== null || cancelledByRequest) {
           status = 'killed'
-          detail = `signal: ${outcome.signal}`
+          // Windows reports a terminated child as exit code 1 without a
+          // signal marker, so an explicit cancellation is tracked directly.
+          detail = cancelledByRequest ? 'cancelled by request' : `signal: ${outcome.signal}`
         } else if (finalStatus === 'SUCCESS') {
           status = 'completed'
           detail = 'completed'
@@ -1217,25 +1410,31 @@ class AntigravitySubagentProvider implements SubagentProvider {
             (finalError !== undefined && finalError.length > 0 ? finalError : stderr.trim()) || `agy exited with code ${String(outcome.exitCode)}`,
           )
         }
-        this.remember(id, conversationId, plan.childCwd, label)
-        if (conversationId !== undefined && this.runRecords.has(id)) {
-          const records = loadTaskRegistry(config)
-          records[id] = this.runRecords.get(id) as TaskRecord
-          await saveTaskRegistry(config, records, ctx.logger)
-          taskLine = `\n[task: ${id}]`
-        } else {
-          taskLine = '\n[task: (none — this agy build did not provide a conversation_id)]'
-        }
-        // A stream-json build always streams the response text; only patch in
-        // the final response when the fallback (json/text) mode delivered none.
-        if (finalResponse !== undefined && finalResponse.length > 0 && !sawDelta) {
-          visible += finalResponse
-        }
-        return { status, detail }
+      } catch (error) {
+        // A spawn failure (ENOENT/cwd/...) must settle the job as failed —
+        // `done` is the jobs contract and must never reject.
+        status = 'failed'
+        detail = `agy background run failed: ${error instanceof Error ? error.message : String(error)}`
       } finally {
         disarmWatchdog()
         plan.releasePromptFile()
       }
+      this.remember(id, conversationId, plan.childCwd, label)
+      if (conversationId !== undefined && this.runRecords.has(id)) {
+        const record = this.runRecords.get(id) as TaskRecord
+        await updateTaskRegistry(config, (records) => {
+          records[id] = record
+        }, ctx.logger)
+        taskLine = `\n[task: ${id}]`
+      } else {
+        taskLine = '\n[task: (none — this agy build did not provide a conversation_id)]'
+      }
+      // A stream-json build always streams the response text; only patch in
+      // the final response when the fallback (json/text) mode delivered none.
+      if (finalResponse !== undefined && finalResponse.length > 0 && !sawDelta) {
+        appendVisible(finalResponse)
+      }
+      return { status, detail }
     })()
 
     const readOutput = (): string => {
@@ -1250,10 +1449,13 @@ class AntigravitySubagentProvider implements SubagentProvider {
     }
 
     const cancel = (): void => {
+      cancelledByRequest = true
       controller.abort()
       terminate()
     }
 
+    // Track for the tasks/cancel tools; released when the job settles.
+    this.trackActive(id, { label, cwd: plan.childCwd, startedAt: Date.now(), background: true, cancel }, done)
     return { cancel, done, readOutput }
   }
 }
@@ -1278,6 +1480,11 @@ function formatMs(ms: number): string {
   if (Number.isInteger(ms) && ms % 60_000 === 0) return `${ms / 60_000} min`
   if (Number.isInteger(ms) && ms % 1000 === 0) return `${ms / 1000} s`
   return `${ms} ms`
+}
+
+/** Render an epoch-ms stamp as a compact UTC ISO string for model-facing lists. */
+function formatStamp(ms: number): string {
+  return new Date(ms).toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, 'Z')
 }
 
 /** A non-`completed` stop reason means the child did not finish cleanly. */
@@ -1337,9 +1544,24 @@ export function apply(ctx: Context, config: Config): void {
   const configuredCwd = config.cwd.length > 0 ? validateConfiguredCwd(PREFIX, config.cwd) : undefined
 
   // Provider registration (effect-scoped: stop/update/unload removes it).
+  const provider = new AntigravitySubagentProvider(ctx, config, configuredCwd)
   ctx.effect(
-    () => ctx.subagents.registerProvider(new AntigravitySubagentProvider(ctx, config, configuredCwd)),
+    () => ctx.subagents.registerProvider(provider),
     `${PREFIX}: provider ${config.providerName}`,
+  )
+
+  // Terminate every in-flight agy process when the plugin stops or updates —
+  // they would otherwise leak as orphans no other provider can manage.
+  ctx.effect(
+    () => () => {
+      try {
+        const terminated = provider.terminateAllActive()
+        if (terminated > 0) ctx.logger.warn(`${PREFIX}: terminated ${terminated} active agy run(s) on plugin stop`)
+      } catch (error) {
+        console.warn(`${PREFIX}: error terminating active runs on plugin stop: ${String(error)}`)
+      }
+    },
+    `${PREFIX}: terminate active runs on dispose`,
   )
 
   // New-task tool (effect-scoped like the provider).
@@ -1349,7 +1571,7 @@ export function apply(ctx: Context, config: Config): void {
         defineTool({
           name: config.toolName,
           description:
-            'Delegate a self-contained task to Google Antigravity CLI (agy) — a separate Gemini-powered coding agent on this machine, authenticated with your Antigravity account (no API key). It works in the parent session\'s workspace and returns its final answer; give it a complete, standalone prompt because it does not see this conversation. The result carries a `task` key: pass it to antigravity_followup to continue this conversation later. If the task targets files OUTSIDE the session workspace (e.g. another project), pass their absolute directory paths in `dirs` — without it, headless agy cannot reach them and will hang until its timeout. Every prompt gets appended environment notes telling agy NOT to use its headless browser tools (they can hang; config `avoidBrowser`, default true) and NOT to read files larger than 1 MB with its read tool (it fails above 4 MB; config `avoidLargeReads`, default true — agy should use grep/sed/run_command instead). When a task genuinely needs a browser preview, say so and have the user set avoidBrowser: false. If a run fails with "authentication required", a login window opens automatically on the machine (config autoLoginWindow, default true) — tell the user to complete the sign-in, or call ' + config.loginToolName + ' to open it manually. Foreground runs are cut off at a ' + formatMs(config.printTimeoutMs) + ' ceiling (agy --print-timeout; configurable via printTimeoutMs) and force-killed ' + formatMs(config.watchdogMarginMs) + ' later if hung. For long tasks use `background: true` and keep the user informed: poll job_output every ~60 seconds and report agy\'s live progress (see the background parameter), then the final result — never wait silently or end the turn while the job runs.',
+            'Delegate a self-contained task to Google Antigravity CLI (agy) — a separate Gemini-powered coding agent on this machine, authenticated with your Antigravity account (no API key). It works in the parent session\'s workspace and returns its final answer; give it a complete, standalone prompt because it does not see this conversation. The result carries a `task` key: pass it to antigravity_followup to continue this conversation later. If the task targets files OUTSIDE the session workspace (e.g. another project), pass their absolute directory paths in `dirs` — without it, headless agy cannot reach them and will hang until its timeout. Every prompt gets appended environment notes telling agy NOT to use its headless browser tools (they can hang; config `avoidBrowser`, default true) and NOT to read files larger than 1 MB with its read tool (it fails above 4 MB; config `avoidLargeReads`, default true — agy should use grep/sed/run_command instead). When a task genuinely needs a browser preview, say so and have the user set avoidBrowser: false. If a run fails with "authentication required", a login window opens automatically on the machine (config autoLoginWindow, default true) — tell the user to complete the sign-in, or call ' + config.loginToolName + ' to open it manually. Foreground runs are cut off at a ' + formatMs(config.printTimeoutMs) + ' ceiling (agy --print-timeout; configurable via printTimeoutMs) and force-killed ' + formatMs(config.watchdogMarginMs) + ' later if hung. For long tasks use `background: true` and keep the user informed: poll job_output every ~60 seconds and report agy\'s live progress (see the background parameter), then the final result — never wait silently or end the turn while the job runs. List running/recent tasks with ' + config.tasksToolName + ', and stop a running one with ' + config.cancelToolName + '.',
           parameters: {
             description: {
               type: 'string',
@@ -1442,9 +1664,9 @@ export function apply(ctx: Context, config: Config): void {
             )
             const record = provider.recordOf(settled.runId)
             if (record !== undefined) {
-              const records = loadTaskRegistry(config)
-              records[settled.runId] = record
-              await saveTaskRegistry(config, records, ctx.logger)
+              await updateTaskRegistry(config, (records) => {
+                records[settled.runId] = record
+              }, ctx.logger)
             }
             return { ...settled, task: settled.runId }
           },
@@ -1460,7 +1682,7 @@ export function apply(ctx: Context, config: Config): void {
         defineTool({
           name: config.followupToolName,
           description:
-            'Continue a previous Antigravity (agy) task in the same conversation: the child agent resumes with its full prior context. Use the `task` key returned by the antigravity tool (foreground result or the [task: ...] line of a background job). Each follow-up is one new prompt in that conversation; the response is the agent\'s final text for this turn. Same ' + formatMs(config.printTimeoutMs) + ' run ceiling as the antigravity tool.',
+            'Continue a previous Antigravity (agy) task in the same conversation: the child agent resumes with its full prior context. Use the `task` key returned by the antigravity tool (foreground result or the [task: ...] line of a background job), or list recorded keys with ' + config.tasksToolName + ' (they survive DSH restarts). Each follow-up is one new prompt in that conversation; the response is the agent\'s final text for this turn. Same ' + formatMs(config.printTimeoutMs) + ' run ceiling as the antigravity tool; keep prompts under 30000 characters.',
           parameters: {
             description: {
               type: 'string',
@@ -1519,8 +1741,9 @@ export function apply(ctx: Context, config: Config): void {
               ),
             )
             const refreshed = provider.recordOf(settled.runId)
-            records[args.task] = { ...record, createdAt: Date.now(), ...(refreshed !== undefined ? { conversationId: refreshed.conversationId } : {}) }
-            await saveTaskRegistry(config, records, ctx.logger)
+            await updateTaskRegistry(config, (records) => {
+              records[args.task] = { ...record, createdAt: Date.now(), ...(refreshed !== undefined ? { conversationId: refreshed.conversationId } : {}) }
+            }, ctx.logger)
             return { ...settled, task: args.task }
           },
         }),
@@ -1561,7 +1784,163 @@ export function apply(ctx: Context, config: Config): void {
     `${PREFIX}: tool ${config.loginToolName}`,
   )
 
+  // Tasks tool: list in-flight runs plus durable registry history. This is
+  // the only restart-safe way to recover a `task` key for the follow-up tool.
+  ctx.effect(
+    () =>
+      ctx.tools.register(
+        defineTool({
+          name: config.tasksToolName,
+          description:
+            'List Antigravity (agy) tasks: currently running tasks (foreground and background) plus recently finished tasks from the durable registry (~/.dsh/agy-conversations.json, or registryPath). Task keys survive DSH restarts — use a `task` key with ' +
+            config.followupToolName +
+            ' to resume that conversation, or pass one to ' +
+            config.cancelToolName +
+            ' to stop a running task.',
+          parameters: {
+            limit: {
+              type: 'number',
+              description: 'How many recently finished tasks to include, newest first (default 20, max 50).',
+            },
+          },
+          output: {
+            schema: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                running: {
+                  type: 'array',
+                  items: {
+                    type: 'object',
+                    additionalProperties: false,
+                    properties: {
+                      task: { type: 'string', required: true },
+                      label: { type: 'string', required: true },
+                      cwd: { type: 'string', required: true },
+                      background: { type: 'boolean', required: true },
+                      startedAt: { type: 'number', required: true },
+                    },
+                  },
+                },
+                recent: {
+                  type: 'array',
+                  items: {
+                    type: 'object',
+                    additionalProperties: false,
+                    properties: {
+                      task: { type: 'string', required: true },
+                      label: { type: 'string', required: true },
+                      cwd: { type: 'string', required: true },
+                      createdAt: { type: 'number', required: true },
+                    },
+                  },
+                },
+              },
+            },
+            render: (_args: unknown, value: { running?: unknown[]; recent?: unknown[] }) => {
+              const lines: string[] = []
+              const running = value.running ?? []
+              const recent = value.recent ?? []
+              if (running.length === 0) {
+                lines.push('No running tasks.')
+              } else {
+                lines.push(`Running (${running.length}):`)
+                for (const entry of running) {
+                  const item = entry as { task?: unknown; label?: unknown; background?: unknown; startedAt?: unknown }
+                  lines.push(
+                    `  task: ${String(item.task ?? '?')}  label: ${String(item.label ?? '')}  mode: ${item.background === true ? 'background' : 'foreground'}  started: ${formatStamp(typeof item.startedAt === 'number' ? item.startedAt : 0)}`,
+                  )
+                }
+              }
+              if (recent.length === 0) {
+                lines.push('No recent finished tasks in the registry.')
+              } else {
+                lines.push(`Recent finished (${recent.length}):`)
+                for (const entry of recent) {
+                  const item = entry as { task?: unknown; label?: unknown; createdAt?: unknown }
+                  lines.push(
+                    `  task: ${String(item.task ?? '?')}  label: ${String(item.label ?? '')}  created: ${formatStamp(typeof item.createdAt === 'number' ? item.createdAt : 0)}`,
+                  )
+                }
+              }
+              return [{ type: 'text', text: lines.join('\n') }]
+            },
+          },
+          isConcurrencySafe: () => true,
+          async execute(args: { limit?: number }) {
+            const current = ctx.subagents.getProvider(config.providerName) as AntigravitySubagentProvider | undefined
+            if (!(current instanceof AntigravitySubagentProvider)) {
+              throw new Error(`${PREFIX}: provider "${config.providerName}" is not the antigravity provider`)
+            }
+            const running = current.listActive()
+            const records = loadTaskRegistry(config, ctx.logger)
+            const limit = Math.max(0, Math.min(50, Math.floor(args.limit ?? 20)))
+            const recent = Object.entries(records)
+              .sort((a, b) => b[1].createdAt - a[1].createdAt)
+              .slice(0, limit)
+              .map(([task, record]) => ({ task, label: record.label, cwd: record.cwd, createdAt: record.createdAt }))
+            return { running, recent }
+          },
+        }),
+      ),
+    `${PREFIX}: tool ${config.tasksToolName}`,
+  )
+
+  // Cancel tool: stop a running task by its task key; the agy process tree
+  // is terminated and the run settles as cancelled (its conversation record,
+  // if any, stays in the registry for later follow-up).
+  ctx.effect(
+    () =>
+      ctx.tools.register(
+        defineTool({
+          name: config.cancelToolName,
+          description:
+            'Stop a running Antigravity (agy) task by its task key. Get running task keys from ' +
+            config.tasksToolName +
+            ' (or the `task` field of an in-flight antigravity call). The agy process tree is terminated and the run settles as cancelled; its conversation record (if any) is kept for follow-up.',
+          parameters: {
+            task: {
+              type: 'string',
+              required: true,
+              description: 'The task key of a RUNNING task (see ' + config.tasksToolName + ').',
+            },
+          },
+          output: {
+            schema: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                cancelled: { type: 'boolean', required: true },
+                task: { type: 'string', required: true },
+                message: { type: 'string', required: true },
+              },
+            },
+            render: (_args: unknown, value: { message: string }) => [{ type: 'text', text: value.message }],
+          },
+          isConcurrencySafe: () => true,
+          async execute(args: { task: string }) {
+            const current = ctx.subagents.getProvider(config.providerName) as AntigravitySubagentProvider | undefined
+            if (!(current instanceof AntigravitySubagentProvider)) {
+              throw new Error(`${PREFIX}: provider "${config.providerName}" is not the antigravity provider`)
+            }
+            const cancelled = current.cancelActive(args.task)
+            if (!cancelled) {
+              throw new Error(
+                `${PREFIX}: no running task "${args.task}" — running tasks are listed by ${config.tasksToolName}; finished tasks cannot be cancelled (their conversations resume via ${config.followupToolName})`,
+              )
+            }
+            return {
+              cancelled: true,
+              task: args.task,
+              message: `Cancellation requested for task ${args.task} — its run settles as cancelled.`,
+            }
+          },
+        }),
+      ),
+    `${PREFIX}: tool ${config.cancelToolName}`,
+  )
+
   ctx.logger.info(
-    `${PREFIX}: provider "${config.providerName}" + tools "${config.toolName}" / "${config.followupToolName}" ready (command: ${config.command}${config.model ? `, model: ${config.model}` : ''})`,
+    `${PREFIX}: provider "${config.providerName}" + tools "${config.toolName}" / "${config.followupToolName}" / "${config.tasksToolName}" / "${config.cancelToolName}" ready (command: ${config.command}${config.model ? `, model: ${config.model}` : ''})`,
   )
 }

@@ -30,7 +30,7 @@ dsh plugin --profile web add github:ZEM17/dsh-subagent-agy
 
 **从安装包安装**：到
 [Releases 页面](https://github.com/ZEM17/dsh-subagent-agy/releases) 下载
-`dsh-external-dsh-subagent-antigravity-0.1.0.tgz`，然后：
+`dsh-external-dsh-subagent-antigravity-0.2.0.tgz`，然后：
 
 ```bash
 dsh plugin --profile web add /path/to/dsh-external-dsh-subagent-antigravity-0.1.0.tgz
@@ -48,6 +48,8 @@ dsh plugin --profile web add /path/to/dsh-external-dsh-subagent-antigravity-0.1.
 |---|---|---|
 | 新任务 | `antigravity` | 把独立任务委托给 agy（新对话）；返回 `task` 键 |
 | 续聊 | `antigravity_followup` | 通过 `task` 键继续之前的 agy 对话——上下文完整延续 |
+| 任务列表 | `antigravity_tasks` | 列出运行中 + 最近完成的任务；`task` 键在 DSH 重启后仍然有效 |
+| 取消任务 | `antigravity_cancel` | 用 `task` 键停止一个运行中的任务（终止 agy 进程树） |
 | 登录 | `antigravity_login` | 弹出 agy 交互式登录窗口（认证失败时也会自动弹出） |
 
 示例：
@@ -72,6 +74,11 @@ agy 的模型是多模态的——把图片路径写进 prompt，它就能描述
 - **长任务**：模型会自动用 `background: true` 后台运行——期间向你实时汇报
   进度，完成后给出最终结果。
 - **继续之前的任务**：告诉模型用上次返回的 `task` 键续聊。
+- **找回任务键**：`antigravity_tasks` 列出运行中和最近完成的任务——任务键
+  记录在 `~/.dsh/agy-conversations.json`，DSH 重启后依然存在，随时可以找回
+  用于续聊。
+- **停止任务**：用运行中任务的键调用 `antigravity_cancel`（后台任务也可用
+  `job_kill`）。
 
 ---
 
@@ -97,6 +104,8 @@ dsh-subagent-antigravity:
 | `toolName` | `antigravity` | 新任务工具名 |
 | `followupToolName` | `antigravity_followup` | 续聊工具名 |
 | `loginToolName` | `antigravity_login` | 登录窗口工具名 |
+| `tasksToolName` | `antigravity_tasks` | 任务列表工具名 |
+| `cancelToolName` | `antigravity_cancel` | 取消任务工具名 |
 | `command` | `agy` | 可执行文件（PATH 名或绝对路径） |
 | `model` | `''` | `--model <slug>`（见 `agy models`）；留空 = agy 默认 |
 | `effort` | `''` | `--effort low\|medium\|high`；留空 = 不传 |
@@ -130,6 +139,11 @@ dsh-subagent-antigravity:
 使用 `stream-json` 提供实时进度，并接入 DSH 的任务系统（`job_output` /
 `job_kill`）。本地看门狗会终止卡死的运行——**任何情况下都不会无限等待**。
 
+`antigravity_tasks` 展示持久注册表（重启安全）和实时运行中的任务，
+`antigravity_cancel` 可以停止某个运行中的任务。注册表自带自愈：损坏的
+文件会先备份一次（`*.corrupt`）再重置，绝不会被静默覆盖；所有注册表
+写入都是串行化的，并发运行不会互相丢失记录。
+
 ---
 
 ## 故障排查
@@ -143,6 +157,7 @@ dsh-subagent-antigravity:
 | `cannot resolve "agy"` | 设置 `AGY_BIN` 指向 agy 可执行文件 |
 | 任务卡在浏览器工具上 | `avoidBrowser`（默认开启）已阻止；确实需要浏览器预览时才设 `false` |
 | `file size (…) exceeds limit` | agy 读取工具上限 4 MB；`avoidLargeReads`（默认开启）已让 agy 改用 grep/sed——或瘦身该文件 |
+| 注册表损坏 | 插件会把损坏的文件备份一次到 `*.corrupt` 再重置注册表——历史记录绝不会被静默覆盖 |
 
 ---
 

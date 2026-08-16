@@ -10,10 +10,10 @@
  * Exit code 0 = all checks passed; 1 = at least one check failed.
  */
 import { spawn } from 'node:child_process'
-import { existsSync, mkdtempSync, readdirSync, rmSync } from 'node:fs'
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const ROOT = dirname(fileURLToPath(import.meta.url)) + '/..'
 const E2E = process.argv.includes('--e2e')
@@ -110,7 +110,7 @@ if (agy) {
 
   console.log('== registry round trip ==')
   try {
-    const plugin = await import(join(ROOT, 'lib/index.js'))
+    const plugin = await import(pathToFileURL(join(ROOT, 'lib/index.js')).href)
     const dir = mkdtempSync(join(tmpdir(), 'agy-selftest-'))
     try {
       const registryPath = join(dir, 'nested', 'registry.json')
@@ -129,6 +129,65 @@ if (agy) {
         pass('no temp files left behind (atomic write)')
       } else {
         report('registry atomic write', `temp files remain: ${leftovers.join(', ')}`)
+      }
+
+      // Corrupt registry: backed up once (mtime-guarded) and reset — the
+      // next save must never silently overwrite the damaged history.
+      const corruptDir = join(dir, 'corrupt')
+      const corruptPath = join(corruptDir, 'registry.json')
+      mkdirSync(corruptDir, { recursive: true })
+      const corruptText = '{ this is not valid json !!!'
+      writeFileSync(corruptPath, corruptText, 'utf8')
+      const corruptConfig = { registryPath: corruptPath }
+      const warnings = []
+      const warnSink = { warn: (m) => warnings.push(m) }
+      const firstLoad = plugin.loadTaskRegistry(corruptConfig, warnSink)
+      const backupPath = `${corruptPath}.corrupt`
+      if (Object.keys(firstLoad).length === 0 && existsSync(backupPath) && readFileSync(backupPath, 'utf8') === corruptText) {
+        pass('corrupt registry backed up once and reset')
+      } else {
+        report('corrupt registry self-heal', `expected {} + .corrupt backup, got ${JSON.stringify(firstLoad)}`)
+      }
+      plugin.loadTaskRegistry(corruptConfig, warnSink)
+      if (warnings.length >= 2 && readFileSync(backupPath, 'utf8') === corruptText) {
+        pass('corrupt registry warns on repeat loads without clobbering the backup')
+      } else {
+        report('corrupt registry repeat', `expected >= 2 warnings, got ${warnings.length}`)
+      }
+
+      // Malformed entries are dropped with a warning; valid entries survive.
+      const mixedPath = join(dir, 'mixed', 'registry.json')
+      mkdirSync(dirname(mixedPath), { recursive: true })
+      const mixedConfig = { registryPath: mixedPath }
+      await plugin.saveTaskRegistry(mixedConfig, {
+        good: { conversationId: 'conv-good', cwd: 'cwd-good', label: 'x', createdAt: 1 },
+        bad1: { conversationId: 42, cwd: 'c', createdAt: 1 },
+        bad2: 'nope',
+      })
+      const mixed = plugin.loadTaskRegistry(mixedConfig, { warn: () => {} })
+      if (mixed.good?.conversationId === 'conv-good' && !mixed.bad1 && !mixed.bad2) {
+        pass('malformed registry entries dropped, valid entries kept')
+      } else {
+        report('registry entry validation', JSON.stringify(mixed))
+      }
+
+      // Concurrent read-modify-write cycles serialize: no lost record.
+      const racePath = join(dir, 'race', 'registry.json')
+      mkdirSync(dirname(racePath), { recursive: true })
+      const raceConfig = { registryPath: racePath }
+      await Promise.all([
+        plugin.updateTaskRegistry(raceConfig, (r) => {
+          r.a = { conversationId: 'ca', cwd: 'c', createdAt: 1 }
+        }),
+        plugin.updateTaskRegistry(raceConfig, (r) => {
+          r.b = { conversationId: 'cb', cwd: 'c', createdAt: 2 }
+        }),
+      ])
+      const raced = plugin.loadTaskRegistry(raceConfig)
+      if (raced.a?.conversationId === 'ca' && raced.b?.conversationId === 'cb') {
+        pass('concurrent registry updates serialize (no lost record)')
+      } else {
+        report('concurrent registry updates', JSON.stringify(raced))
       }
     } finally {
       rmSync(dir, { recursive: true, force: true })
